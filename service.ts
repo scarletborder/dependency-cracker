@@ -14,6 +14,8 @@ interface Result {
     defaultExport: string | null;
     commonExport: Set<SymbolName>;
     styleImports: Set<FileName>;
+    // 新增：记录重导出映射关系 (导出名 -> {来源文件, 原始符号名})
+    reExportMap: Map<SymbolName, { source: FileName; originalSymbol: SymbolName }>;
 }
 
 type FileAnalysisResult = Map<FileName, Result>;
@@ -69,10 +71,10 @@ export class DependencyAnalysisService {
     }
 
     /**
- * 查询文件的所有最终依赖文件
- * @param absFilePath 要查询的文件绝对路径
- * @returns 最终依赖文件的绝对路径数组
- */
+     * 查询文件的所有最终依赖文件
+     * @param absFilePath 要查询的文件绝对路径
+     * @returns 最终依赖文件的绝对路径数组
+     */
     public query(absFilePath: string): string[] {
         const actualPath = this.resolveFilePath(absFilePath);
         if (!actualPath) {
@@ -108,7 +110,6 @@ export class DependencyAnalysisService {
 
         return Array.from(finalDeps);
     }
-
 
     /**
      * 递归查找所有最终依赖文件
@@ -183,11 +184,24 @@ export class DependencyAnalysisService {
             return sources;
         }
 
-        // 检查该符号是否是从其他文件导入的（重导出的情况）
+        // 检查该符号是否是重导出的
+        const reExportInfo = fileInfo.reExportMap.get(symbol);
+        if (reExportInfo) {
+            // 这是一个重导出的符号，继续追踪原始符号
+            const subSources = this.traceSymbolSource(
+                reExportInfo.source,
+                reExportInfo.originalSymbol,
+                new Set(visited)
+            );
+            subSources.forEach(s => sources.add(s));
+            return sources;
+        }
+
+        // 检查该符号是否是从其他文件导入的（不是通过 export { ... } from 的形式）
         let foundInImports = false;
         for (const [importPath, importedSymbols] of fileInfo.import.entries()) {
-            if (importedSymbols.has(symbol)) {
-                // 这个符号是从其他文件导入的，继续追踪
+            // 排除已经在 reExportMap 中处理的情况
+            if (importedSymbols.has(symbol) && !fileInfo.reExportMap.has(symbol)) {
                 foundInImports = true;
                 const subSources = this.traceSymbolSource(importPath, symbol, new Set(visited));
                 subSources.forEach(s => sources.add(s));
@@ -195,7 +209,7 @@ export class DependencyAnalysisService {
         }
 
         // 如果符号没有在导入中找到，说明是该文件自己定义的
-        if (!foundInImports) {
+        if (!foundInImports && !reExportInfo) {
             sources.add(filePath);
         }
 
@@ -296,7 +310,8 @@ export class DependencyAnalysisService {
             import: new Map<FileName, Set<SymbolName>>(),
             defaultExport: null,
             commonExport: new Set<SymbolName>(),
-            styleImports: new Set<FileName>()
+            styleImports: new Set<FileName>(),
+            reExportMap: new Map()
         };
 
         // 分析 AST
@@ -539,7 +554,6 @@ export class DependencyAnalysisService {
             if (this.isLocalImportPath(exportPath)) {
                 const absoluteExportPath = this.resolveImportPath(currentFilePath, exportPath);
                 const importSymbols = new Set<SymbolName>();
-                const exportSymbols = new Set<SymbolName>();
 
                 if (node.exportClause) {
                     if (ts.isNamedExports(node.exportClause)) {
@@ -549,12 +563,24 @@ export class DependencyAnalysisService {
                                 : element.name.text;
                             const exportName = element.name.text;
 
-                            if (originalName === 'default') {
-                                importSymbols.add('default');
-                                exportSymbols.add(exportName);
+                            // 记录导入的符号
+                            importSymbols.add(originalName);
+
+                            // 添加到导出集合
+                            result.commonExport.add(exportName);
+
+                            // 记录重导出映射关系
+                            if (originalName !== exportName || originalName === 'default') {
+                                result.reExportMap.set(exportName, {
+                                    source: absoluteExportPath,
+                                    originalSymbol: originalName
+                                });
                             } else {
-                                importSymbols.add(originalName);
-                                exportSymbols.add(exportName);
+                                // 即使名字相同，也记录重导出关系
+                                result.reExportMap.set(exportName, {
+                                    source: absoluteExportPath,
+                                    originalSymbol: originalName
+                                });
                             }
                         });
                     } else if (ts.isNamespaceExport(node.exportClause)) {
@@ -564,7 +590,9 @@ export class DependencyAnalysisService {
                             if (targetExports.defaultExport) {
                                 importSymbols.add('default');
                             }
-                            exportSymbols.add(node.exportClause.name.text);
+                            const namespaceName = node.exportClause.name.text;
+                            result.commonExport.add(namespaceName);
+                            // 命名空间导出不需要记录 reExportMap
                         }
                     }
                 } else {
@@ -573,20 +601,25 @@ export class DependencyAnalysisService {
                     if (targetExports) {
                         targetExports.commonExport.forEach(s => {
                             importSymbols.add(s);
-                            exportSymbols.add(s);
+                            result.commonExport.add(s);
+                            // 记录重导出映射
+                            result.reExportMap.set(s, {
+                                source: absoluteExportPath,
+                                originalSymbol: s
+                            });
                         });
                     }
                 }
 
+                // 记录导入关系（用于依赖分析）
                 if (importSymbols.size > 0) {
                     const existingImports = result.import.get(absoluteExportPath) || new Set();
                     importSymbols.forEach(s => existingImports.add(s));
                     result.import.set(absoluteExportPath, existingImports);
                 }
-
-                exportSymbols.forEach(s => result.commonExport.add(s));
             }
         } else if (node.exportClause && ts.isNamedExports(node.exportClause)) {
+            // 本地导出（不是从其他文件重导出）
             node.exportClause.elements.forEach(element => {
                 result.commonExport.add(element.name.text);
             });
